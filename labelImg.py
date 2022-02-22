@@ -104,6 +104,12 @@ class MainWindow(QMainWindow, WindowMixin):
         self.cur_img_idx = 0
         self.img_count = len(self.m_img_list)
 
+        # For filtering images
+        self.labels_by_img = {}
+        self.filtered_img_indexes = []
+        self.is_filtering_active = False
+        self.cur_filtered_img_idx = 0
+
         # Whether we need to save or not.
         self.dirty = False
 
@@ -172,8 +178,14 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.file_list_widget = QListWidget()
         self.file_list_widget.itemDoubleClicked.connect(self.file_item_double_clicked)
+        self.label_filter_combo_box = QComboBox()
+        self.label_filter_combo_box.addItem('*')
+        self.label_filter_combo_box.addItems(self.label_hist)
+        self.label_filter_combo_box.currentIndexChanged.connect(self.filter_files_by_label)
+
         file_list_layout = QVBoxLayout()
         file_list_layout.setContentsMargins(0, 0, 0, 0)
+        file_list_layout.addWidget(self.label_filter_combo_box)
         file_list_layout.addWidget(self.file_list_widget)
         file_list_container = QWidget()
         file_list_container.setLayout(file_list_layout)
@@ -497,6 +509,7 @@ class MainWindow(QMainWindow, WindowMixin):
         # Since loading the file may take some time, make sure it runs in the background.
         if self.file_path and os.path.isdir(self.file_path):
             self.queue_event(partial(self.import_dir_images, self.file_path or ""))
+            self.queue_event(partial(self.import_annotations, self.default_save_dir or ""))
         elif self.file_path:
             self.queue_event(partial(self.load_file, self.file_path or ""))
 
@@ -733,11 +746,81 @@ class MainWindow(QMainWindow, WindowMixin):
             item.setBackground(generate_color_by_text(text))
             self.set_dirty()
             self.update_combo_box()
+            if self.is_filtering_active:
+                if self.filtered_img_indexes[self.cur_filtered_img_idx] == self.filtered_img_indexes[-1]:
+                    self.open_prev_image()
+                else:
+                    self.open_next_image()
+                    self.cur_filtered_img_idx -= 1
+                self.filtered_img_indexes.remove(self.filtered_img_indexes[self.cur_filtered_img_idx])
+                filtered_list = [self.m_img_list[idx] for idx in self.filtered_img_indexes]
+                self.refresh_file_list(filtered_list)
+                self.save_file()
+
+    def filter_files_by_label(self, index):
+        if self.auto_saving.isChecked() and self.default_save_dir is not None and self.dirty:
+            self.save_file()
+        elif not self.may_continue():
+            return
+        filtered_list = []
+        canvasVisibility = True
+        if index == 0:
+            self.is_filtering_active = False
+            self.filtered_img_indexes = []
+            filtered_list = self.m_img_list
+        else:
+            self.cur_filtered_img_idx = 0
+            self.filtered_img_indexes = []
+            self.is_filtering_active = True
+            label = self.label_hist[index - 1]
+            for img, labels in self.labels_by_img.items():
+                if label in labels:
+                    self.filtered_img_indexes.append(self.m_img_list.index(img))
+                    filtered_list.append(img)
+            if len(self.filtered_img_indexes) > 0:
+                if self.cur_img_idx not in self.filtered_img_indexes:
+                    idx = self.filtered_img_indexes[0]
+                    self.cur_img_idx = idx
+                    self.load_file(self.m_img_list[idx])
+            else:
+                canvasVisibility = False
+        self.refresh_file_list(filtered_list)
+        self.canvas.setVisible(canvasVisibility)
+
+    def refresh_file_list(self, files):
+        self.file_list_widget.clear()
+        for f in files:
+            item = QListWidgetItem(f)
+            self.file_list_widget.addItem(item)
+
+    def delete_filtered_label(self, shape):
+        img = self.m_img_list[self.cur_img_idx]
+        label = shape.label
+        if label in self.labels_by_img[img]:
+            self.labels_by_img[img].remove(label)
+        self.save_file()
+        if self.is_filtering_active and len(self.filtered_img_indexes) > 0 and label not in self.labels_by_img[img]:
+            if self.filtered_img_indexes[self.cur_filtered_img_idx] == self.filtered_img_indexes[-1]:
+                self.open_prev_image()
+            else:
+                self.open_next_image()
+                self.cur_filtered_img_idx -= 1
+            self.filtered_img_indexes.remove(self.filtered_img_indexes[self.cur_filtered_img_idx])
+            if (len(self.filtered_img_indexes) == 0):
+                self.canvas.setVisible(False)
+            filtered_list = [self.m_img_list[idx] for idx in self.filtered_img_indexes]
+            self.refresh_file_list(filtered_list)
 
     # Tzutalin 20160906 : Add file list and dock to move faster
     def file_item_double_clicked(self, item=None):
         self.cur_img_idx = self.m_img_list.index(ustr(item.text()))
         filename = self.m_img_list[self.cur_img_idx]
+        # Update current filtered index
+        if self.is_filtering_active:
+            try:
+                self.cur_filtered_img_idx = self.filtered_img_indexes.index(self.cur_img_idx)
+            except ValueError as e:
+                pass
         if filename:
             self.load_file(filename)
 
@@ -920,7 +1003,11 @@ class MainWindow(QMainWindow, WindowMixin):
         shape = self.items_to_shapes[item]
         label = item.text()
         if label != shape.label:
-            shape.label = item.text()
+            img = self.m_img_list[self.cur_img_idx]
+            self.labels_by_img[img].append(label)
+            self.labels_by_img[img].remove(shape.label)
+
+            shape.label = label
             shape.line_color = generate_color_by_text(shape.label)
             self.set_dirty()
         else:  # User probably changed item visibility
@@ -965,6 +1052,10 @@ class MainWindow(QMainWindow, WindowMixin):
         else:
             # self.canvas.undoLastLine()
             self.canvas.reset_all_lines()
+
+        # Update for filtering
+        img = self.m_img_list[self.cur_img_idx]
+        self.labels_by_img[img].append(shape.label)
 
     def scroll_request(self, delta, orientation):
         units = - delta / (8 * 15)
@@ -1067,7 +1158,7 @@ class MainWindow(QMainWindow, WindowMixin):
         # Highlight the file item
         if unicode_file_path and self.file_list_widget.count() > 0:
             if unicode_file_path in self.m_img_list:
-                index = self.m_img_list.index(unicode_file_path)
+                index = self.cur_filtered_img_idx if self.is_filtering_active else self.m_img_list.index(unicode_file_path)
                 file_widget_item = self.file_list_widget.item(index)
                 file_widget_item.setSelected(True)
             else:
@@ -1298,6 +1389,28 @@ class MainWindow(QMainWindow, WindowMixin):
         self.last_open_dir = target_dir_path
         self.import_dir_images(target_dir_path)
 
+    def import_annotations(self, path):
+        filenames_without_extension = [os.path.basename(os.path.splitext(f)[0]) for f in self.m_img_list]
+        for name, f in zip(filenames_without_extension, self.m_img_list):
+            annotation_file = f"{os.path.join(path, name)}{LabelFile.suffix}"
+            if os.path.exists(annotation_file) and os.path.isfile(annotation_file):
+                if self.label_file_format == LabelFileFormat.PASCAL_VOC:
+                    t_voc_parse_reader = PascalVocReader(annotation_file)
+                    shapes = t_voc_parse_reader.get_shapes()
+                elif self.label_file_format == LabelFileFormat.YOLO:
+                    image = read(f, None)
+                    t_yolo_parse_reader = YoloReader(annotation_file, image)
+                    shapes = t_yolo_parse_reader.get_shapes()
+                else:
+                    t_ml_parse_reader = CreateMLReader(annotation_file)
+                    shapes = t_ml_parse_reader.get_shapes()
+                labels = [s[0] for s in shapes]
+                for label in labels:
+                    if f not in self.labels_by_img:
+                        self.labels_by_img[f] = [label]
+                    else:
+                        self.labels_by_img[f].append(label)
+
     def import_dir_images(self, dir_path):
         if not self.may_continue() or not dir_path:
             return
@@ -1350,11 +1463,18 @@ class MainWindow(QMainWindow, WindowMixin):
         if self.file_path is None:
             return
 
-        if self.cur_img_idx - 1 >= 0:
+        filename = None
+        if self.is_filtering_active:
+            if self.cur_filtered_img_idx - 1 >= 0:
+                self.cur_filtered_img_idx -= 1
+                idx = self.filtered_img_indexes[self.cur_filtered_img_idx]
+                self.cur_img_idx = idx
+                filename = self.m_img_list[idx]
+        elif self.cur_img_idx - 1 >= 0:
             self.cur_img_idx -= 1
             filename = self.m_img_list[self.cur_img_idx]
-            if filename:
-                self.load_file(filename)
+        if filename:
+            self.load_file(filename)
 
     def open_next_image(self, _value=False):
         # Proceeding next image without dialog if having any label
@@ -1379,6 +1499,12 @@ class MainWindow(QMainWindow, WindowMixin):
         if self.file_path is None:
             filename = self.m_img_list[0]
             self.cur_img_idx = 0
+        elif self.is_filtering_active:
+            if len(self.filtered_img_indexes) > 0 and self.filtered_img_indexes[self.cur_filtered_img_idx] != self.filtered_img_indexes[-1]:
+                self.cur_filtered_img_idx += 1
+                idx = self.filtered_img_indexes[self.cur_filtered_img_idx]
+                self.cur_img_idx = idx
+                filename = self.m_img_list[idx]
         else:
             if self.cur_img_idx + 1 < self.img_count:
                 self.cur_img_idx += 1
@@ -1505,11 +1631,13 @@ class MainWindow(QMainWindow, WindowMixin):
             self.set_dirty()
 
     def delete_selected_shape(self):
-        self.remove_label(self.canvas.delete_selected())
+        shape = self.canvas.delete_selected()
+        self.remove_label(shape)
         self.set_dirty()
         if self.no_shapes():
             for action in self.actions.onShapesPresent:
                 action.setEnabled(False)
+        self.delete_filtered_label(shape)
 
     def choose_shape_line_color(self):
         color = self.color_dialog.getColor(self.line_color, u'Choose Line Color',
