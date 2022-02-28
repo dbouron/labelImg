@@ -3,6 +3,7 @@ from libs.ustr import ustr
 import hashlib
 import re
 import sys
+import os.path
 
 try:
     from PyQt5.QtGui import *
@@ -115,3 +116,19 @@ if QT5:
 else:
     def trimmed(text):
         return text.trimmed()
+
+def read_image(filename, default=None):
+    try:
+        reader = QImageReader(filename)
+        reader.setAutoTransform(True)
+        return reader.read()
+    except:
+        return default
+
+def count_annotation_files(path, label_ext, class_file):
+    files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f)) and f.endswith(label_ext)]
+    try:
+        files.remove(os.path.basename(class_file))
+    except ValueError:
+        pass
+    return len(files)

@@ -51,6 +51,8 @@ from libs.create_ml_io import CreateMLReader
 from libs.create_ml_io import JSON_EXT
 from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
+from libs.annotationImporter import AnnotationImporter
+from libs.styleSheetLoader import StyleSheetLoader
 
 __appname__ = 'labelImg'
 
@@ -73,6 +75,15 @@ class WindowMixin(object):
         self.addToolBar(Qt.LeftToolBarArea, toolbar)
         return toolbar
 
+class ProgressBarThread(QRunnable):
+    def __init__(self, main_window):
+        QThread.__init__(self)
+        self.main_window = main_window
+
+    def run(self):
+        self.main_window.threadpool.waitForDone()
+        self.main_window.label_filter_combo_box.setEnabled(True)
+        self.main_window.progress_bar_container.setVisible(False)
 
 class MainWindow(QMainWindow, WindowMixin):
     FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = list(range(3))
@@ -86,11 +97,15 @@ class MainWindow(QMainWindow, WindowMixin):
         self.settings.load()
         settings = self.settings
 
-        self.os_name = platform.system()
+        # Threadpool for annotations import
+        self.threadpool = QThreadPool()
 
         # Load string bundle for i18n
         self.string_bundle = StringBundle.get_bundle()
         get_str = lambda str_id: self.string_bundle.get_string(str_id)
+
+        # Load QSS
+        self.progress_bar_qss = StyleSheetLoader.load_style_sheet("progress_bar")
 
         # Save as Pascal voc xml
         self.default_save_dir = default_save_dir
@@ -119,7 +134,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Load predefined classes to the list
         self.load_predefined_classes(default_prefdef_class_file)
-
+        self.class_file = default_prefdef_class_file
         self.default_label = self.label_hist[0]
 
         # Main widgets and related state.
@@ -182,11 +197,27 @@ class MainWindow(QMainWindow, WindowMixin):
         self.label_filter_combo_box.addItem('*')
         self.label_filter_combo_box.addItems(self.label_hist)
         self.label_filter_combo_box.currentIndexChanged.connect(self.filter_files_by_label)
+        self.label_filter_combo_box.setEnabled(False)
+
+        self.progress_bar = QProgressBar()
+        if self.progress_bar_qss is not None:
+            self.progress_bar.setStyleSheet(self.progress_bar_qss)
+        progress_bar_font = QFont()
+        progress_bar_font.setPointSize(8)
+        progress_bar_label = QLabel(get_str('loadingAnnotations'))
+        progress_bar_label.setFont(progress_bar_font)
+        progress_bar_layout = QHBoxLayout()
+        progress_bar_layout.setContentsMargins(2, 2, 2, 2)
+        progress_bar_layout.addWidget(progress_bar_label)
+        progress_bar_layout.addWidget(self.progress_bar)
+        self.progress_bar_container = QWidget()
+        self.progress_bar_container.setLayout(progress_bar_layout)
 
         file_list_layout = QVBoxLayout()
         file_list_layout.setContentsMargins(0, 0, 0, 0)
         file_list_layout.addWidget(self.label_filter_combo_box)
         file_list_layout.addWidget(self.file_list_widget)
+        file_list_layout.addWidget(self.progress_bar_container)
         file_list_container = QWidget()
         file_list_container.setLayout(file_list_layout)
         self.file_dock = QDockWidget(get_str('fileList'), self)
@@ -1183,7 +1214,7 @@ class MainWindow(QMainWindow, WindowMixin):
             else:
                 # Load image:
                 # read data first and store for saving into label file.
-                self.image_data = read(unicode_file_path, None)
+                self.image_data = read_image(unicode_file_path, None)
                 self.label_file = None
                 self.canvas.verified = False
 
@@ -1389,27 +1420,28 @@ class MainWindow(QMainWindow, WindowMixin):
         self.last_open_dir = target_dir_path
         self.import_dir_images(target_dir_path)
 
+    def accumulate_labels(self, result):
+        img = result[0]
+        shapes = result[1]
+        labels = [s[0] for s in shapes]
+        for label in labels:
+            if img not in self.labels_by_img:
+                self.labels_by_img[img] = [label]
+            else:
+                self.labels_by_img[img].append(label)
+
     def import_annotations(self, path):
+        annotation_count = count_annotation_files(path, LabelFile.suffix, self.class_file)
         filenames_without_extension = [os.path.basename(os.path.splitext(f)[0]) for f in self.m_img_list]
         for name, f in zip(filenames_without_extension, self.m_img_list):
             annotation_file = f"{os.path.join(path, name)}{LabelFile.suffix}"
             if os.path.exists(annotation_file) and os.path.isfile(annotation_file):
-                if self.label_file_format == LabelFileFormat.PASCAL_VOC:
-                    t_voc_parse_reader = PascalVocReader(annotation_file)
-                    shapes = t_voc_parse_reader.get_shapes()
-                elif self.label_file_format == LabelFileFormat.YOLO:
-                    image = read(f, None)
-                    t_yolo_parse_reader = YoloReader(annotation_file, image)
-                    shapes = t_yolo_parse_reader.get_shapes()
-                else:
-                    t_ml_parse_reader = CreateMLReader(annotation_file)
-                    shapes = t_ml_parse_reader.get_shapes()
-                labels = [s[0] for s in shapes]
-                for label in labels:
-                    if f not in self.labels_by_img:
-                        self.labels_by_img[f] = [label]
-                    else:
-                        self.labels_by_img[f].append(label)
+                importer = AnnotationImporter(f, annotation_file, self.label_file_format, annotation_count)
+                importer.signals.result.connect(self.accumulate_labels)
+                importer.signals.progress.connect(self.progress_bar.setValue)
+                self.threadpool.start(importer)
+        thr = ProgressBarThread(self)
+        QtCore.QThreadPool.globalInstance().start(thr)
 
     def import_dir_images(self, dir_path):
         if not self.may_continue() or not dir_path:
@@ -1732,15 +1764,6 @@ class MainWindow(QMainWindow, WindowMixin):
 
 def inverted(color):
     return QColor(*[255 - v for v in color.getRgb()])
-
-
-def read(filename, default=None):
-    try:
-        reader = QImageReader(filename)
-        reader.setAutoTransform(True)
-        return reader.read()
-    except:
-        return default
 
 
 def get_main_app(argv=None):
